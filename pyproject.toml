@@ -21,7 +21,7 @@ classifiers = [
 dependencies = [
     "requests",
     "beautifulsoup4",
-    "browsercookie",
+    "browser-cookie3",
     "websocket-client",
     "click",
 ]

@@ -10,7 +10,7 @@ from typing import List, Optional, Union, overload, Literal, Dict
 import json
 from dataclasses import dataclass, field
 from websocket import create_connection
-import browsercookie
+import browser_cookie3 as browsercookie
 import requests
 from bs4 import BeautifulSoup
 
@@ -162,7 +162,12 @@ class Api:
         r = self._get_session().get(f"https://{self._host}/", **self._request_kwargs)
         r.raise_for_status()
         content = BeautifulSoup(r.content, features="html.parser")
-        data = content.find("meta", dict(name="ol-prefetchedProjectsBlob")).get("content")
+        
+        projects_meta = content.find("meta", dict(name="ol-prefetchedProjectsBlob"))
+        if projects_meta is None:
+            raise RuntimeError("Failed to fetch projects. Please ensure that you are logged into Overleaf in your browser and that your session is valid.")
+        
+        data = projects_meta.get("content")
         data = json.loads(data)
         projects = []
         for project_data in data["projects"]:
@@ -174,7 +179,11 @@ class Api:
             projects.append(proj)
 
         # Add tags to projects
-        tags = content.find("meta", dict(name="ol-tags")).get("content")
+        tags_meta = content.find("meta", dict(name="ol-tags"))
+        if tags_meta is None:
+             raise RuntimeError("Failed to fetch tags. Please ensure that you are logged into Overleaf in your browser and that your session is valid.")
+        
+        tags = tags_meta.get("content")
         tags = json.loads(tags)
         proj_map = {proj.id: proj for proj in projects}
         for tag_data in tags:

@@ -21,7 +21,7 @@ pip install 'pyoverleaf'
 ```
 
 Before using the API, make sure you are logged into Overleaf in your default web browser.
-Currently, only Google Chrome and Mozilla Firefox are supported: https://github.com/richardpenman/browsercookie
+Currently, only Google Chrome and Mozilla Firefox are supported: https://github.com/borisbabic/browser_cookie3
 Test if everything is working by listing the projects:
 ```bash
 pyoverleaf ls
