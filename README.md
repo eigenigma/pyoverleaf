@@ -146,7 +146,7 @@ pyoverleaf rm project-name/path/to/new/directory
 
 ### Reading and writing files
 ```bash
-# Writing to a file
+# Writing to a file (whole-file upload; replaces all content)
 echo "new content" | pyoverleaf write project-name/path/to/file.txt
 
 # Uploading an image
@@ -155,3 +155,114 @@ cat image.jpg | pyoverleaf write project-name/path/to/image.jpg
 # Reading a file
 pyoverleaf read project-name/path/to/file.txt
 ```
+
+### Patching docs without clobbering collaborators (`patch`)
+
+`pyoverleaf write` performs a whole-file upload. If a collaborator has
+unsaved keystrokes in the same doc, those keystrokes will be **lost**.
+For docs being edited by live collaborators, use `pyoverleaf patch`
+instead, which submits the change through Overleaf's `applyOtUpdate`
+socket channel so the server merges your edit with concurrent edits
+via Operational Transformation (OT).
+
+```bash
+# Patch an existing doc (collab-safe; preserves concurrent edits)
+cat new-main.tex | pyoverleaf patch project-name/main.tex
+
+# Submit as a tracked change (visible in Overleaf's Review panel)
+cat new-main.tex | pyoverleaf patch -t project-name/main.tex
+```
+
+The command reads stdin as UTF-8 text, diffs against the current
+server-side document, sends the resulting ops, and waits for the
+server's sender-shape `otUpdateApplied` echo before returning. The
+post-edit version is reported to stderr as `v<old> -> v<new>`. If the
+server applies our update but the resulting document is unchanged
+(e.g. the op was nullified by a concurrent collaborator update), the
+command exits non-zero with a `silent no-op` message.
+
+`patch` only works on text docs; binary file uploads still go through
+`pyoverleaf write`. Note also that the project's per-user
+`track_changes_on_for_me` setting may force tracked-changes mode even
+without `-t`.
+
+### Surgical find-and-replace (`replace`)
+
+For targeted single-string edits (typo fixes, renames), `patch` is
+overkill: it forces the caller to assemble the whole new file body.
+`pyoverleaf replace` runs a literal find-and-replace internally and
+submits the result through the same OT path, so collab-safety is
+identical.
+
+```bash
+# Replace a single occurrence (the safe default — rejects multi-match)
+pyoverleaf replace project-name/main.tex -f "teh" -r "the"
+
+# Replace the first 3 occurrences explicitly
+pyoverleaf replace -n 3 project-name/main.tex -f "TODO" -r "DONE"
+
+# Replace every occurrence (must opt in)
+pyoverleaf replace --all project-name/main.tex -f "old phrase" -r "new phrase"
+```
+
+By default `replace` requires the find string to occur exactly once;
+multiple matches are treated as ambiguous and rejected with exit code
+3 (so a typo fix can't silently rewrite five unrelated occurrences).
+Pass `-n N` to take the first N matches, or `--all` to allow every
+match.
+
+Other exit codes: 0 = success, 1 = no occurrences, 2 = silent no-op
+(server applied the op but the doc is unchanged).
+
+## Collab-safe Python API: `api.write_doc` and `api.apply_ot_update`
+
+Mirroring the CLI, the `Api` class exposes two new methods for
+collaboration-safe doc edits:
+
+```python
+import pyoverleaf
+
+api = pyoverleaf.Api()
+api.login_from_browser()
+
+# High-level: diff a string against the current server text, submit,
+# verify, and return the new version.
+result = api.write_doc(project_id, "main.tex", "new file contents",
+                       track_changes=False,
+                       raise_on_silent_noop=True)
+print(result.old_version, "->", result.new_version,
+      "silent_no_op=", result.silent_no_op)
+
+# Low-level: submit a caller-built op list against a known version.
+new_version = api.apply_ot_update(
+    project_id,
+    doc_id,
+    [{"p": 0, "i": "hello "}],
+    version=12,
+    track_changes=False,
+)
+```
+
+`write_doc` raises `pyoverleaf.SilentNoOpError` by default when the
+submitted ops produced no observable change to the server-side text;
+pass `raise_on_silent_noop=False` to receive the flag on the returned
+`WriteResult` instead. Both methods raise `pyoverleaf.OtUpdateError`
+when the server emits `otUpdateError` (e.g. payload too large).
+
+`ProjectIO.write_doc(path, content, ...)` is a thin convenience wrapper
+that resolves the project id for you.
+
+For literal find-and-replace inside a doc, use
+`api.find_and_replace(project_id, "main.tex", "old", "new",
+expect_unique=True, count=None, track_changes=False)` (also exposed as
+`ProjectIO.find_and_replace`). Returns a
+`FindReplaceResult(replacements, old_version, new_version)` where
+`old_version`/`new_version` are `None` when nothing matched (no socket
+round-trip in that case).
+
+The default `expect_unique=True` raises
+`pyoverleaf.MultipleMatchesError` (`e.occurrences`, `e.find`) when the
+find string occurs more than once, so a single-edit caller can't
+silently rewrite many unrelated occurrences. Disambiguate by passing
+`count=N` for the first N matches or `expect_unique=False` for
+replace-all.
