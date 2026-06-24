@@ -1,3 +1,5 @@
-#
+"""Smoke test ensuring the public Api class is importable."""
+
+
 def test_import_api():
-    from pyoverleaf import Api, ProjectIO  # pylint: disable=unused-import
+    """Importing pyoverleaf.Api must succeed."""

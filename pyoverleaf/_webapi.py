@@ -1,172 +1,95 @@
-from base64 import b64encode
-import ssl
-import urllib.parse
-import time
+"""Overleaf web API client.
+
+`Api` speaks Overleaf's HTTP and Socket.IO endpoints — the same channel
+the official editor uses — and returns the typed objects from
+`_models`. All write paths require a prior `login_from_*` call; reads
+that hit the dashboard or a project page do too.
+
+The OT-write surface (`apply_ot_update`, `write_doc`, `find_and_replace`)
+and tracked-changes / comments methods are attached at package import
+time by `_otapi` and `_otapi_reviews`; they live on the same `Api`
+instance even though they are not declared in this file.
+"""
+
 try:
     import http.cookiejar as cookielib
 except ImportError:
-    import cookielib  # type: ignore
-from typing import List, Optional, Union, overload, Literal, Dict
+    import cookielib  # type: ignore[no-redef]
 import json
-from dataclasses import dataclass, field
-from websocket import create_connection
+from pathlib import Path
+from typing import Any, Literal, overload
+
 import browser_cookie3 as browsercookie
 import requests
 from bs4 import BeautifulSoup
 
-
-@dataclass
-class User:
-    id: str
-    email: str
-    first_name: str
-    last_name: Optional[str]
-
-    @classmethod
-    def from_data(cls, data: dict):
-        return cls(
-            id=data["id"],
-            email=data["email"],
-            first_name=data["firstName"],
-            last_name=data.get("lastName"),
-        )
-
-
-@dataclass
-class Tag:
-    id: str
-    name: str
-    color: Optional[str]
-
-    @classmethod
-    def from_data(cls, data: dict):
-        return cls(
-            id=data["_id"],
-            name=data["name"],
-            color=data.get("color"),
-        )
-
-
-@dataclass
-class Project:
-    id: str
-    name: str
-    last_updated: str
-    access_level: str
-    source: str
-    archived: bool
-    trashed: bool
-    owner: Optional[User] = None
-    last_updated_by: Optional[User] = None
-    tags: Optional[List[Tag]] = field(default_factory=list)
-
-    @classmethod
-    def from_data(cls, data: dict):
-        out = cls(
-            id=data["id"],
-            name=data["name"],
-            last_updated=data["lastUpdated"],
-            access_level=data["accessLevel"],
-            source=data["source"],
-            archived=data["archived"],
-            trashed=data["trashed"],
-        )
-
-        owner_data = data.get("owner")
-        if owner_data is not None:
-            out.owner = User.from_data(owner_data)
-
-        last_updated_by_data = data.get("lastUpdatedBy")
-        if last_updated_by_data is not None:
-            out.last_updated_by = User.from_data(last_updated_by_data)
-
-        return out
-
-
-@dataclass
-class ProjectFile:
-    id: str
-    name: str
-    created: Optional[str]
-    type: Literal["file", "doc"] = "file"
-
-    @classmethod
-    def from_data(cls, data: dict):
-        return cls(
-            id=data["_id"],
-            name=data["name"],
-            created=data.get("created", None),
-        )
-
-    def __str__(self):
-        return self.name
-
-@dataclass
-class ProjectFolder:
-    id: str
-    name: str
-    children: List[Union[ProjectFile, "ProjectFolder"]] = field(default_factory=list)
-
-    @classmethod
-    def from_data(cls, data: dict):
-        out = cls(
-            id=data["_id"],
-            name=data["name"],
-        )
-        for child in data["folders"]:
-            out.children.append(ProjectFolder.from_data(child))
-
-        for child in data["fileRefs"]:
-            out.children.append(ProjectFile.from_data(child))
-
-        for child in data["docs"]:
-            doc = ProjectFile.from_data(child)
-            doc.type = "doc"
-            out.children.append(doc)
-        return out
-
-    def __str__(self):
-        out = self.name + ":"
-        for child in self.children:
-            child_str = str(child)
-            out += "\n"
-            for line in child_str.splitlines(True):
-                out += "  " + line
-        return out
-
-    @property
-    def type(self):
-        return "folder"
-
+from ._models import Project, ProjectFile, ProjectFolder, Tag
+from ._websocket import open_socket as _open_socket_impl
 
 
 class Api:
-    def __init__(self, *, timeout: int = 16, proxies=None, ssl_verify: bool = True, host: str = "www.overleaf.com"):
+    """HTTP + Socket.IO client for an Overleaf instance.
+
+    Construct, call `login_from_browser` (or `login_from_cookies`), then
+    drive the project/file methods. One instance corresponds to one
+    Overleaf account session against one `host`; cookies are stored on
+    the instance and shared across calls. Not thread-safe.
+    """
+
+    def __init__(
+        self,
+        *,
+        timeout: int = 16,
+        proxies: dict[str, str] | None = None,
+        ssl_verify: bool = True,
+        host: str = "www.overleaf.com",
+    ) -> None:
+        """Configure the client without performing any network I/O.
+
+        Args:
+            timeout: Per-request timeout in seconds for the underlying
+                `requests.Session`.
+            proxies: Optional mapping of `requests`-style proxy URLs.
+            ssl_verify: Whether to verify TLS certificates; turn off for
+                self-hosted Overleaf with self-signed certs.
+            host: Overleaf hostname (defaults to the public service).
+        """
         self._session_initialized = False
-        self._cookies = None
-        self._request_kwargs = { "timeout": timeout }
+        self._cookies: cookielib.CookieJar | None = None
+        self._request_kwargs = {"timeout": timeout}
         self._proxies = proxies
         self._ssl_verify = ssl_verify
-        self._csrf_cache = None
+        self._csrf_cache: tuple[str, str] | None = None
         self._host = host
 
-    def get_projects(self, *, trashed: bool = False, archived: bool = False) -> List[Project]:
-        """
-        Get the full list of projects.
+    def get_projects(
+        self, *, trashed: bool = False, archived: bool = False
+    ) -> list[Project]:
+        """List projects visible on the dashboard.
 
-        :param trashed: Whether to include trashed projects.
-        :param archived: Whether to include archived projects.
-        :return: A list of projects.
+        Scrapes the `ol-prefetchedProjectsBlob` / `ol-tags` meta tags
+        from `GET /` (the same payload the editor's project list reads).
+        Each project is annotated with its tags as a side effect.
+
+        Args:
+            trashed: Whether to include trashed projects.
+            archived: Whether to include archived projects.
+
+        Returns:
+            A list of projects.
         """
         self._assert_session_initialized()
         r = self._get_session().get(f"https://{self._host}/", **self._request_kwargs)
         r.raise_for_status()
         content = BeautifulSoup(r.content, features="html.parser")
-        
-        projects_meta = content.find("meta", dict(name="ol-prefetchedProjectsBlob"))
+
+        projects_meta = content.find("meta", {"name": "ol-prefetchedProjectsBlob"})
         if projects_meta is None:
-            raise RuntimeError("Failed to fetch projects. Please ensure that you are logged into Overleaf in your browser and that your session is valid.")
-        
+            raise RuntimeError(
+                "Failed to fetch projects. Please ensure that you are logged"
+                " into Overleaf in your browser and that your session is valid."
+            )
+
         data = projects_meta.get("content")
         data = json.loads(data)
         projects = []
@@ -179,10 +102,13 @@ class Api:
             projects.append(proj)
 
         # Add tags to projects
-        tags_meta = content.find("meta", dict(name="ol-tags"))
+        tags_meta = content.find("meta", {"name": "ol-tags"})
         if tags_meta is None:
-             raise RuntimeError("Failed to fetch tags. Please ensure that you are logged into Overleaf in your browser and that your session is valid.")
-        
+            raise RuntimeError(
+                "Failed to fetch tags. Please ensure that you are logged"
+                " into Overleaf in your browser and that your session is valid."
+            )
+
         tags = tags_meta.get("content")
         tags = json.loads(tags)
         proj_map = {proj.id: proj for proj in projects}
@@ -197,36 +123,46 @@ class Api:
         return projects
 
     @overload
-    def download_project(self, project_id: str) -> bytes:
-        ...
+    def download_project(self, project_id: str) -> bytes: ...
 
     @overload
-    def download_project(self, project_id: str, output_path: str) -> None:
-        ...
+    def download_project(self, project_id: str, output_path: str) -> None: ...
 
-    def download_project(self, project_id: str, output_path: Optional[str] = None) -> Union[bytes, None]:
-        """
-        Download a project as a zip file.
+    def download_project(
+        self, project_id: str, output_path: str | None = None
+    ) -> bytes | None:
+        """Download a project as a zip via `GET /project/{id}/download/zip`.
 
-        :param project_id: The id of the project to download.
-        :param output_path: The path to save the project to. If none, the project will be returned as bytes.
-        :return: The zipped project if output_path is None, else None.
+        Args:
+            project_id: The id of the project to download.
+            output_path: Where to save the zip. When `None`, the bytes
+                are returned instead of written to disk.
+
+        Returns:
+            The zipped project if `output_path` is `None`, else `None`.
         """
         self._assert_session_initialized()
-        r = self._get_session().get(f"https://{self._host}/project/{project_id}/download/zip", **self._request_kwargs)
+        r = self._get_session().get(
+            f"https://{self._host}/project/{project_id}/download/zip",
+            **self._request_kwargs,
+        )
         r.raise_for_status()
         if output_path is not None:
-            with open(output_path, "wb") as f:
-                f.write(r.content)
+            Path(output_path).write_bytes(r.content)
             return None
         return r.content
 
     def project_get_files(self, project_id: str) -> ProjectFolder:
-        """
-        Get the root directory of a project.
+        """Get the root folder tree for a project.
 
-        :param project_id: The id of the project.
-        :return: The root directory of the project.
+        Opens a Socket.IO session, waits for `joinProjectResponse`, and
+        returns its `rootFolder[0]` as a `ProjectFolder`.
+
+        Args:
+            project_id: The id of the project.
+
+        Returns:
+            The root directory of the project.
         """
         data = None
         socket = self._open_socket(project_id)
@@ -237,7 +173,7 @@ class Api:
                 raise RuntimeError("Could not get project files.")
             if line.startswith("5:"):
                 break
-        data = json.loads(line[len("5:"):].lstrip(":"))
+        data = json.loads(line[len("5:") :].lstrip(":"))
 
         # Parse the data
         assert data["name"] == "joinProjectResponse"
@@ -245,150 +181,204 @@ class Api:
         assert len(data["project"]["rootFolder"]) == 1
         return ProjectFolder.from_data(data["project"]["rootFolder"][0])
 
-    def project_create_folder(self, project_id: str, parent_folder_id: str, folder_name: str) -> ProjectFolder:
-        """
-        Create a folder in a project.
+    def project_create_folder(
+        self, project_id: str, parent_folder_id: str, folder_name: str
+    ) -> ProjectFolder:
+        """Create a folder via `POST /project/{id}/folder`.
 
-        :param project_id: The id of the project.
-        :param parent_folder_id: The id of the parent folder.
-        :param folder_name: The name of the folder.
+        Args:
+            project_id: The id of the project.
+            parent_folder_id: The id of the parent folder.
+            folder_name: The name of the folder.
+
+        Returns:
+            The newly created `ProjectFolder`.
         """
         self._assert_session_initialized()
-        r = self._get_session().post(f"https://{self._host}/project/{project_id}/folder", json={
-            "parent_folder_id": parent_folder_id,
-            "name": folder_name
-        }, **self._request_kwargs, headers={
-            "Referer": f"https://{self._host}/project/{project_id}",
-            "Accept": "application/json",
-            "Cache-Control": "no-cache",
-            "x-csrf-token": self._get_csrf_token(project_id),
-        })
+        r = self._get_session().post(
+            f"https://{self._host}/project/{project_id}/folder",
+            json={"parent_folder_id": parent_folder_id, "name": folder_name},
+            **self._request_kwargs,
+            headers={
+                "Referer": f"https://{self._host}/project/{project_id}",
+                "Accept": "application/json",
+                "Cache-Control": "no-cache",
+                "x-csrf-token": self._get_csrf_token(project_id),
+            },
+        )
         r.raise_for_status()
-        new_project_folder = ProjectFolder.from_data(json.loads(r.content))
-        return new_project_folder
+        return ProjectFolder.from_data(json.loads(r.content))
 
-    def project_upload_file(self, project_id: str, folder_id: str, file_name: str, file_content: bytes) -> ProjectFile:
-        """
-        Upload a file to a project.
+    def project_upload_file(
+        self, project_id: str, folder_id: str, file_name: str, file_content: bytes
+    ) -> ProjectFile:
+        """Upload a file via `POST /project/{id}/upload?folder_id={fid}`.
 
-        :param project_id: The id of the project.
-        :param folder_id: The id of the folder to upload to.
-        :param file_name: The name of the file.
-        :param file_content: The content of the file.
+        Whole-file upload — overwrites any existing file with the same
+        name in the target folder. For collaboration-safe edits to live
+        docs use `write_doc` (OT path) instead.
+
+        Args:
+            project_id: The id of the project.
+            folder_id: The id of the folder to upload to.
+            file_name: The name of the file.
+            file_content: The raw bytes to upload.
+
+        Returns:
+            The `ProjectFile` returned by the server.
         """
         mime = "application/octet-stream"
         self._assert_session_initialized()
-        r = self._get_session().post(f"https://{self._host}/project/{project_id}/upload?folder_id={folder_id}",
+        r = self._get_session().post(
+            f"https://{self._host}/project/{project_id}/upload?folder_id={folder_id}",
             files={
                 "relativePath": (None, "null"),
                 "name": (None, file_name),
                 "type": (None, mime),
                 "qqfile": (file_name, file_content, mime),
-            }, **self._request_kwargs, headers={
-            "Referer": f"https://{self._host}/project/{project_id}",
-            "Accept": "application/json",
-            "Cache-Control": "no-cache",
-            "x-csrf-token": self._get_csrf_token(project_id),
-        })
+            },
+            **self._request_kwargs,
+            headers={
+                "Referer": f"https://{self._host}/project/{project_id}",
+                "Accept": "application/json",
+                "Cache-Control": "no-cache",
+                "x-csrf-token": self._get_csrf_token(project_id),
+            },
+        )
         r.raise_for_status()
         response = json.loads(r.content)
-        new_file = ProjectFile(
+        return ProjectFile(
             response["entity_id"],
             name=file_name,
             created=None,
-            type=response["entity_type"])
-        return new_file
+            type=response["entity_type"],
+        )
 
     @overload
-    def project_download_file(self, project_id: str, file: ProjectFile) -> bytes:
-        ...
+    def project_download_file(self, project_id: str, file: ProjectFile) -> bytes: ...
 
     @overload
-    def project_download_file(self, project_id: str, file: ProjectFile, output_path: str) -> None:
-        ...
+    def project_download_file(
+        self, project_id: str, file: ProjectFile, output_path: str
+    ) -> None: ...
 
-    def project_download_file(self, project_id: str, file: ProjectFile, output_path: Optional[str] = None) -> Union[bytes, None]:
-        """
-        Download a file from a project.
-        
-        :param project_id: The id of the project.
-        :param file: The file to download.
-        :param output_path: The path to save the file to. If none, the file will be returned as bytes.
-        :return: The file if output_path is None, else None.
+    def project_download_file(
+        self, project_id: str, file: ProjectFile, output_path: str | None = None
+    ) -> bytes | None:
+        """Download a project file.
+
+        Static binaries use `GET /project/{id}/file/{file_id}`; docs are
+        pulled over the OT socket via `_pull_doc_project_file_content`
+        and returned as UTF-8 bytes.
+
+        Args:
+            project_id: The id of the project.
+            file: The file to download.
+            output_path: Where to save the bytes. When `None`, the bytes
+                are returned instead of written to disk.
+
+        Returns:
+            The file bytes if `output_path` is `None`, else `None`.
         """
         self._assert_session_initialized()
         if file.type == "file":
-            r = self._get_session().get(f"https://{self._host}/project/{project_id}/file/{file.id}", **self._request_kwargs)  # pylint: disable=protected-access
+            r = self._get_session().get(
+                f"https://{self._host}/project/{project_id}/file/{file.id}",
+                **self._request_kwargs,
+            )
             r.raise_for_status()
             if output_path is not None:
-                with open(output_path, "wb") as f:
-                    f.write(r.content)
+                Path(output_path).write_bytes(r.content)
                 return None
             return r.content
-        elif file.type == "doc":
-            return self._pull_doc_project_file_content(project_id, file.id).encode("utf-8")
-        else:
-            raise ValueError(f"Unknown file type: {file.type}")
+        if file.type == "doc":
+            return self._pull_doc_project_file_content(project_id, file.id).encode(
+                "utf-8"
+            )
+        raise ValueError(f"Unknown file type: {file.type}")
 
     @overload
-    def project_delete_entity(self, project_id: str, entity: Union[ProjectFile, ProjectFolder]) -> None:
-        ...
+    def project_delete_entity(
+        self, project_id: str, entity: ProjectFile | ProjectFolder
+    ) -> None: ...
 
     @overload
-    def project_delete_entity(self, project_id: str, entity: str, entity_type: Literal["file", "doc", "folder"]) -> None:
-        ...
+    def project_delete_entity(
+        self,
+        project_id: str,
+        entity: str,
+        entity_type: Literal["file", "doc", "folder"],
+    ) -> None: ...
 
-    def project_delete_entity(self, project_id: str, entity, entity_type=None) -> None:
-        """
-        Delete a file/folder/doc from the project
+    def project_delete_entity(
+        self,
+        project_id: str,
+        entity: ProjectFile | ProjectFolder | str,
+        entity_type: Literal["file", "doc", "folder"] | None = None,
+    ) -> None:
+        """Delete a file/folder/doc via `DELETE /project/{id}/{type}/{id}`.
 
-        :param project_id: The id of the project.
-        :param entity_id: The id of the entity to delete.
+        Args:
+            project_id: The id of the project.
+            entity: Either a `ProjectFile`/`ProjectFolder` (in which
+                case `entity_type` is inferred), or the raw entity id
+                as a string.
+            entity_type: Required when `entity` is a string id; one of
+                `"file"`, `"doc"`, `"folder"`.
         """
         if entity_type is None:
-            assert isinstance(entity, ProjectFile) or isinstance(entity, ProjectFolder)
+            assert isinstance(entity, ProjectFile | ProjectFolder)
             entity_type = entity.type
             entity = entity.id
         else:
             assert isinstance(entity, str)
         self._assert_session_initialized()
-        r = self._get_session().delete(f"https://{self._host}/project/{project_id}/{entity_type}/{entity}", json={}, **self._request_kwargs, headers={
-            "Referer": f"https://{self._host}/project/{project_id}",
-            "Accept": "application/json",
-            "Cache-Control": "no-cache",
-            "x-csrf-token": self._get_csrf_token(project_id),
-        })
+        r = self._get_session().delete(
+            f"https://{self._host}/project/{project_id}/{entity_type}/{entity}",
+            json={},
+            **self._request_kwargs,
+            headers={
+                "Referer": f"https://{self._host}/project/{project_id}",
+                "Accept": "application/json",
+                "Cache-Control": "no-cache",
+                "x-csrf-token": self._get_csrf_token(project_id),
+            },
+        )
         r.raise_for_status()
 
-    def login_from_browser(self):
-        """
-        Login to Overleaf using the default browser's cookies.
-        """
+    def login_from_browser(self) -> None:
+        """Login to Overleaf using the default browser's cookies."""
         cookies = browsercookie.load()
         self.login_from_cookies(cookies)
 
     @overload
-    def login_from_cookies(self, cookies: Dict[str, str]):
-        """
-        Login to Overleaf using a dictionary of cookies.
-        """
+    def login_from_cookies(self, cookies: dict[str, str]) -> None: ...
 
     @overload
-    def login_from_cookies(self, cookies: cookielib.CookieJar):
-        """
-        Login to Overleaf using a CookieJar.
-        """
+    def login_from_cookies(self, cookies: cookielib.CookieJar) -> None: ...
 
-    def login_from_cookies(self, cookies):
+    def login_from_cookies(self, cookies: dict[str, str] | cookielib.CookieJar) -> None:
+        """Install session cookies on the client.
+
+        Accepts either a name->value dict (which is wrapped into a
+        CookieJar scoped to `self._host`) or a CookieJar; only cookies
+        matching the configured host are retained.
+
+        Args:
+            cookies: Either a dict of cookie name -> value or a
+                `cookielib.CookieJar`.
+        """
         dot_host = self._host
-        if dot_host[:4] == 'www.':
+        if dot_host[:4] == "www.":
             dot_host = f".{self._host.removeprefix('www.')}"
 
         if not isinstance(cookies, cookielib.CookieJar):
             assert isinstance(cookies, dict)
             cookies_jar = cookielib.CookieJar()
             for name, value in cookies.items():
-                cookies_jar.set_cookie(requests.cookies.create_cookie(name, value, domain=dot_host))
+                cookies_jar.set_cookie(
+                    requests.cookies.create_cookie(name, value, domain=dot_host)
+                )
             cookies = cookies_jar
 
         assert isinstance(cookies, cookielib.CookieJar)
@@ -399,37 +389,51 @@ class Api:
         self._session_initialized = True
 
     def _pull_doc_project_file_content(self, project_id: str, file_id: str) -> str:
+        text, _version, _ranges = self._pull_doc_joindoc_ack(project_id, file_id)
+        return text
+
+    def _pull_doc_snapshot(
+        self, project_id: str, file_id: str
+    ) -> "tuple[str, int, dict]":
+        """Pull a doc's text, version, and ranges (tracked changes + comments).
+
+        Sibling to `_pull_doc_project_file_content` that returns the full
+        joinDoc ack payload. Versions and ranges are needed by the
+        `snapshot` CLI command but not by the existing text-only callers.
+        """
+        return self._pull_doc_joindoc_ack(project_id, file_id)
+
+    def _pull_doc_joindoc_ack(
+        self, project_id: str, file_id: str
+    ) -> "tuple[str, int, dict]":
         socket = None
         try:
             socket = self._open_socket(project_id)
 
-            # Initial waiting
             while True:
                 line = socket.recv()
                 if line.startswith("7:"):
-                    # Unauthorized. TODO: handle this.
                     raise RuntimeError("Could not get project files.")
                 if line.startswith("5:"):
                     break
-            socket.send('5:1+::{"name":"clientTracking.getConnectedUsers"}'.encode("utf-8"))
+            socket.send(b'5:1+::{"name":"clientTracking.getConnectedUsers"}')
 
-            # Join the doc
-            socket.send(f'5:2+::{{"name": "joinDoc", "args": ["{file_id}", {{"encodeRanges": true}}]}}'.encode("utf-8"))
+            socket.send(
+                f'5:2+::{{"name": "joinDoc", "args":'
+                f' ["{file_id}", {{"encodeRanges": true}}]}}'.encode()
+            )
             while True:
                 line = socket.recv()
                 if line.startswith("7:"):
-                    # Unauthorized. TODO: handle this.
                     raise RuntimeError("Could not get project files.")
                 if line.startswith("6:::2+"):
                     break
             data = line[6:]
 
-            # Leave doc
-            socket.send(f"5:3+::{{\"name\": \"leaveDoc\", \"args\": [\"{file_id}\"]}}".encode("utf-8"))
+            socket.send(f'5:3+::{{"name": "leaveDoc", "args": ["{file_id}"]}}'.encode())
             while True:
                 line = socket.recv()
                 if line.startswith("7:"):
-                    # Unauthorized. TODO: handle this.
                     raise RuntimeError("Could not get project files.")
                 if line.startswith("6:::3+"):
                     break
@@ -437,9 +441,17 @@ class Api:
             if socket is not None:
                 socket.close()
                 socket = None
-        return "\n".join(json.loads(data)[1])
 
-    def _get_session(self):
+        from ._ot import decode_packed_utf8
+
+        ack = json.loads(data)
+        doc_lines = ack[1] if len(ack) > 1 else []
+        version = int(ack[2]) if len(ack) > 2 and ack[2] is not None else 0
+        ranges = ack[4] if len(ack) > 4 and isinstance(ack[4], dict) else {}
+        text = "\n".join(decode_packed_utf8(line) for line in doc_lines)
+        return text, version, ranges
+
+    def _get_session(self) -> requests.Session:
         self._assert_session_initialized()
         http_session = requests.Session()
         http_session.cookies = self._cookies
@@ -447,97 +459,23 @@ class Api:
         http_session.verify = self._ssl_verify
         return http_session
 
-    def _assert_session_initialized(self):
+    def _assert_session_initialized(self) -> None:
         if not self._session_initialized:
             raise RuntimeError("Must call api.login_*() before using the api")
 
-    def _get_csrf_token(self, project_id):
+    def _get_csrf_token(self, project_id: str) -> str:
         self._assert_session_initialized()
         # First we pull the csrf token
         if self._csrf_cache is not None and self._csrf_cache[0] == project_id:
             return self._csrf_cache[1]
-        r = self._get_session().get(f"https://{self._host}/project/{project_id}", **self._request_kwargs)
+        r = self._get_session().get(
+            f"https://{self._host}/project/{project_id}", **self._request_kwargs
+        )
         r.raise_for_status()
         content = BeautifulSoup(r.content, features="html.parser")
-        token = content.find("meta", dict(name="ol-csrfToken")).get("content")
+        token = content.find("meta", {"name": "ol-csrfToken"}).get("content")
         self._csrf_cache = (project_id, token)
         return token
 
-    def _open_socket(self, project_id: str) -> bytes:
-        self._assert_session_initialized()
-        time_now = int(time.time() * 1000)
-        session = self._get_session()  # pylint: disable=protected-access
-        r = session.get(
-            f"https://{self._host}/socket.io/1/?projectId={project_id}&t={time_now}", **self._request_kwargs)  # pylint: disable=protected-access
-        r.raise_for_status()
-        content = r.content.decode("utf-8")
-        socket_id = content.split(":")[0]
-        socket_url = f"wss://{self._host}/socket.io/1/websocket/{socket_id}?projectId={project_id}"
-        kwargs = {}
-        cookies = None
-
-        dot_host = f".{self._host.removeprefix('www.')}"
-        cookies = "; ".join([f"{c.name}={c.value}" for c in session.cookies if c.domain.endswith(dot_host)])
-        headers = dict(**session.headers)
-        for header, value in headers.items():
-            if header.lower() == 'cookie':
-                if cookies:
-                    cookies += '; '
-                cookies += value
-                del headers[header]
-                break
-
-        # auth
-        if 'Authorization' not in headers and session.auth is not None:
-            if not isinstance(session.auth, tuple):  # pragma: no cover
-                raise ValueError('Only basic authentication is supported')
-            basic_auth = f'{session.auth[0]}:{session.auth[1]}'.encode('utf-8')  # pylint: disable=unsubscriptable-object
-            basic_auth = b64encode(basic_auth).decode('utf-8')
-            headers['Authorization'] = 'Basic ' + basic_auth
-
-        # cert
-        # this can be given as ('certfile', 'keyfile') or just 'certfile'
-        if isinstance(session.cert, tuple):
-            kwargs['sslopt'] = {
-                'certfile': session.cert[0],  # pylint: disable=unsubscriptable-object
-                'keyfile': session.cert[1]}  # pylint: disable=unsubscriptable-object
-        elif session.cert:
-            kwargs['sslopt'] = {'certfile': session.cert}
-
-        # proxies
-        if session.proxies:
-            proxy_url = None
-            if socket_url.startswith('ws://'):
-                proxy_url = session.proxies.get(
-                    'ws', session.proxies.get('http'))
-            else:  # wss://
-                proxy_url = session.proxies.get(
-                    'wss', session.proxies.get('https'))
-            if proxy_url:
-                parsed_url = urllib.parse.urlparse(
-                    proxy_url if '://' in proxy_url
-                    else 'scheme://' + proxy_url)
-                kwargs['http_proxy_host'] = parsed_url.hostname
-                kwargs['http_proxy_port'] = parsed_url.port
-                kwargs['http_proxy_auth'] = (
-                    (parsed_url.username, parsed_url.password)
-                    if parsed_url.username or parsed_url.password
-                    else None)
-
-        # verify
-        if isinstance(session.verify, str):
-            if 'sslopt' in kwargs:
-                kwargs['sslopt']['ca_certs'] = session.verify
-            else:
-                kwargs['sslopt'] = {'ca_certs': session.verify}
-        elif not session.verify:
-            kwargs['sslopt'] = {"cert_reqs": ssl.CERT_NONE}
-
-        # combine internally generated options with the ones supplied by the
-        # caller. The caller's options take precedence.
-        kwargs['header'] = headers
-        kwargs['cookie'] = cookies
-        kwargs['enable_multithread'] = True
-        if 'timeout' in self._request_kwargs:
-            kwargs['timeout'] = self._request_kwargs['timeout']
-        return create_connection(socket_url, **kwargs)
+    def _open_socket(self, project_id: str) -> Any:
+        return _open_socket_impl(self, project_id)
