@@ -1,4 +1,7 @@
 # PyOverleaf
+
+> **Note:** This is a personal fork of [jkulhanek/pyoverleaf](https://github.com/jkulhanek/pyoverleaf) maintained for the author's own workflow. It adds collaboration-safe OT-based writes (`patch` / `replace`), snapshot, dry-run, figure upload, comments, and tracked-changes commands, and flips a few defaults (notably `--track` on by default). It is **not** intended for upstreaming. If you want the original, lean Overleaf API, use the upstream package.
+
 Unofficial Python API to access Overleaf.
 
 ## Tasks
